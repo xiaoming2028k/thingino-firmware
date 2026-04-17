@@ -1,9 +1,8 @@
 name: firmware-stable
 
-# 触发事件部分（保留你之前的配置，这里一并给出完整可复制版本）
 on:
   schedule:
-    - cron: '30 8 * * 1' # 每周一 UTC 08:30 执行（北京时间 16:30）
+    - cron: '30 8 * * 1'
   workflow_dispatch:
     inputs:
       branch:
@@ -14,11 +13,6 @@ on:
         options:
           - stable
           - master
-      tg_disabled:
-        type: boolean
-        description: 'Disable Telegram notifications'
-        required: false
-        default: false
       tg_scratch:
         type: boolean
         description: 'Use TG scratch channel'
@@ -36,120 +30,126 @@ on:
         default: false
       debug_enabled:
         type: boolean
-        description: 'Enable debug build (with debug symbols)'
+        description: 'Enable debug build'
         required: false
         default: false
 
 jobs:
-  # 假设你之前有 check-updates、notify-begin、finalize-release 等 jobs，这里只修正你提供的部分
-  notify-completion:
-    needs: [finalize-release, notify-begin, check-updates]
-    runs-on: ubuntu-24.04
-    if: ${{ always() && needs.check-updates.outputs.should_build == 'true' }}
+  check-updates:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
     steps:
-      - name: Set timezone
-        run: |
-          sudo timedatectl set-timezone ${{ env.TZ }}
+      - name: Check whether to build
+        id: check
+        run: echo "should_build=true" >> "$GITHUB_OUTPUT"
 
-      - name: Configure Environment
-        run: |
-          echo "TG_DISABLED=${{ github.event.inputs.tg_disabled || 'false' }}" >> $GITHUB_ENV
-          echo "TG_SCRATCH=${{ github.event.inputs.tg_scratch || 'false' }}" >> $GITHUB_ENV
+  notify-begin:
+    runs-on: ubuntu-latest
+    needs: check-updates
+    if: needs.check-updates.outputs.should_build == 'true'
+    outputs:
+      start_time: ${{ steps.start.outputs.start_time }}
+    steps:
+      - name: Record start time
+        id: start
+        run: echo "start_time=$(date -u +%s)" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout repository source
-        uses: actions/checkout@v5
+  build:
+    runs-on: ubuntu-24.04
+    needs: [check-updates, notify-begin]
+    if: needs.check-updates.outputs.should_build == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
         with:
           ref: ${{ github.event.inputs.branch || 'master' }}
           fetch-depth: 1
+          submodules: recursive
 
-      - name: Send notify completion summary
-        if: ${{ env.TG_DISABLED == 'false' }}
+      - name: Free disk space
         run: |
-          # 配置 Telegram 频道
-          if [[ "${TG_SCRATCH}" == "true" ]]; then
-            TG_CHANNEL="${{ env.TG_CHANNEL_SCRATCH }}"
-            TG_TOPIC=""
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt clean
+
+      - name: Install build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            build-essential \
+            libncurses-dev \
+            python3 python3-pip \
+            git wget curl \
+            unzip bzip2 \
+            fakeroot \
+            flex bison gawk \
+            libtool automake autoconf \
+            pkg-config zlib1g-dev
+
+      - name: Prepare toolchain
+        run: |
+          ./scripts/prepare.sh
+
+      - name: Build T20 firmware
+        run: |
+          if [ "${{ github.event.inputs.teacup_only }}" == "true" ]; then
+            make BOARD=t20-teacup all
           else
-            TG_CHANNEL="${{ env.TG_CHANNEL }}"
-            TG_TOPIC="${{ env.TG_TOPIC }}"
+            make BOARD=t20 all
           fi
 
-          # 计算构建耗时
-          START_TIME="${{ needs.notify-begin.outputs.start_time }}"
-          if [[ -z "${START_TIME}" ]]; then
-            echo "::warning::START_TIME not found, using current time as fallback"
-            START_TIME=$(date -u +%s)
-          fi
-          END_TIME=$(date -u +%s)
-          ELAPSED=$((END_TIME - START_TIME))
+      - name: Show firmware files
+        run: |
+          ls -la output/images/
+          ls -la output/
+
+      - name: Upload full firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: openipc-t20-firmware
+          path: |
+            output/images/*.bin
+            output/images/*.img
+            output/*.bin
+            output/*.img
+            bin/*.bin
+            bin/*.img
+
+  finalize-release:
+    runs-on: ubuntu-latest
+    needs: [build, notify-begin]
+    if: always() && needs.check-updates.outputs.should_build == 'true'
+    steps:
+      - name: Download firmware
+        uses: actions/download-artifact@v4
+        with:
+          name: openipc-t20-firmware
+          path: firmware
+
+      - name: List firmware
+        run: ls -la firmware/
+
+  notify-completion:
+    runs-on: ubuntu-24.04
+    needs: [finalize-release, notify-begin, check-updates]
+    if: always() && needs.check-updates.outputs.should_build == 'true'
+    steps:
+      - name: Set timezone
+        run: sudo timedatectl set-timezone Asia/Shanghai
+
+      - name: Calculate build time
+        run: |
+          START=${{ needs.notify-begin.outputs.start_time }}
+          END=$(date -u +%s)
+          ELAPSED=$((END - START))
           ELAPSED_MIN=$((ELAPSED / 60))
           ELAPSED_SEC=$((ELAPSED % 60))
+          echo "ELAPSED=${ELAPSED_MIN}m ${ELAPSED_SEC}s" >> $GITHUB_ENV
 
-          # 调用通知脚本
-          .github/scripts/tg-notify.sh \
-            -s "${TG_TOKEN}" \
-            "${TG_CHANNEL}" \
-            "${TG_TOPIC}" \
-            finish \
-            "${{ github.workflow }}" \
-            "${ELAPSED_MIN}m ${ELAPSED_SEC}s" \
-            "${{ github.run_id }}" \
-            "${{ github.repository }}" \
-            "."
-
-      - name: Generate Release Notes
-        id: generate-notes
-        if: ${{ env.TAG_NAME != '' }}
+      - name: Build completed
         run: |
-          # 生成发布说明（修复你之前的代码，添加引号和安全处理）
-          RELEASE_NOTES="### Changes in this release:\n"
-          while IFS= read -r commit || [[ -n "${commit}" ]]; do
-            if [[ -n "${commit}" ]]; then
-              RELEASE_NOTES+="- ${commit}\n"
-            fi
-          done <<< "${COMMITS}"
-
-          echo -e "${RELEASE_NOTES}" > release_notes.md
-          echo "RELEASE_NOTES_FILE=$(pwd)/release_notes.md" >> $GITHUB_ENV
-
-      - name: Get release ID and Mark as Latest
-        if: ${{ env.TAG_NAME != '' }}
-        run: |
-          echo "=== Environment variables check ==="
-          echo "TAG_NAME: ${{ env.TAG_NAME }}"
-          echo "RELEASE_NOTES_FILE: ${{ env.RELEASE_NOTES_FILE }}"
-
-          # 检查 GH 认证状态
-          echo "=== Checking GH authentication status ==="
-          if ! gh auth status; then
-            echo "::error::GitHub authentication failed"
-            exit 1
-          fi
-
-          # 获取现有 Release URL
-          echo "=== Fetching release for tag ${TAG_NAME} ==="
-          RELEASE_URL=$(gh release view "${TAG_NAME}" --json url -q ".url" 2>/dev/null || echo "")
-          echo "RELEASE_URL: ${RELEASE_URL}"
-
-          if [[ -n "${RELEASE_URL}" ]]; then
-            echo "Release found, updating to latest..."
-            # 编辑 Release，添加发布说明
-            if [[ -f "${{ env.RELEASE_NOTES_FILE }}" ]]; then
-              echo "Including release notes file"
-              gh release edit "${TAG_NAME}" \
-                --latest \
-                --draft=false \
-                --prerelease=false \
-                --notes-file "${{ env.RELEASE_NOTES_FILE }}"
-            else
-              echo "Release notes file not found, skipping notes"
-              gh release edit "${TAG_NAME}" \
-                --latest \
-                --draft=false \
-                --prerelease=false \
-                --notes ""
-            fi
-            echo "Successfully marked release as latest"
-          else
-            echo "Release for tag ${TAG_NAME} not found, skipping update"
-          fi
+          echo "========================================"
+          echo " 君正 T20 摄像头固件编译完成"
+          echo " 耗时：${{ env.ELAPSED }}"
+          echo " 固件已打包，可以直接下载刷机"
+          echo "========================================"
