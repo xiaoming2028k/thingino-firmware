@@ -8,7 +8,7 @@ on:
         type: choice
         description: 'Branch to build from'
         required: false
-        default: 'stable'
+        default: 'master'
         options:
           - stable
           - master
@@ -63,7 +63,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.inputs.branch || 'stable' }}
+          ref: ${{ github.event.inputs.branch || 'master' }}
           fetch-depth: 0
 
       - name: Debug checked out branch and commit
